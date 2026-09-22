@@ -2,7 +2,7 @@ using Oceananigans: fields, Simulation
 using KernelAbstractions: @kernel, @index
 using Oceananigans.Utils: work_layout
 using Oceananigans.Architectures: device, architecture, on_architecture
-using Oceananigans.Biogeochemistry: AbstractBiogeochemistry
+using Oceananigans.Biogeochemistry: AbstractBiogeochemistry, required_biogeochemical_tracers
 using Oceananigans.ImmersedBoundaries: immersed_cell
 
 import Adapt: adapt_structure, adapt
@@ -11,55 +11,227 @@ import Oceananigans.Biogeochemistry: update_tendencies!, update_biogeochemical_s
 import KernelAbstractions as KA
 
 """
-    ZeroNegativeTracers(; exclude = ())
+    ClipNegativeTracers(; exclude = ())
 
-Construct a modifier that zeroes any negative tracers excluding those listed in `exclude`.
+Construct a negative-tracer treatment that clips negative tracer values to zero, excluding those listed in `exclude`.
 
 !!! danger "Tracer conservation"
     This method is _not_ recommended as a way to preserve positivity of tracers since
     it does not conserve the total tracer.
 """
-@kwdef struct ZeroNegativeTracers{E}
-    exclude :: E = ()
-end
+struct ClipNegativeTracers{E} end
 
-function update_biogeochemical_state!(model, zero::ZeroNegativeTracers)
+ClipNegativeTracers(; exclude = ()) = ClipNegativeTracers{Tuple(exclude)}()
+
+@inline excluded_tracers(::ClipNegativeTracers{E}) where E = E
+
+function update_biogeochemical_state!(model, clip::ClipNegativeTracers)
+    exclude = excluded_tracers(clip)
     for (tracer_name, tracer) in pairs(model.tracers)
-        if !(tracer_name in zero.exclude)
+        if !(tracer_name in exclude)
             parent(tracer) .= max.(0.0, parent(tracer))
         end
     end
 end
 
+"""
+    IgnoreNegativeTracerValues()
+
+Construct a negative-tracer treatment that presents negative concentration-tracer values as zero
+when evaluating biogeochemical processes while leaving prognostic tracer fields unchanged. Signed
+environmental tracers such as temperature (`T`) and salinity (`S`) are evaluated unchanged.
+"""
+struct IgnoreNegativeTracerValues{N} end
+
+IgnoreNegativeTracerValues() = IgnoreNegativeTracerValues{nothing}()
+
+@inline resolve_negative_tracers(::IgnoreNegativeTracerValues{nothing}, bgc) =
+    IgnoreNegativeTracerValues{required_biogeochemical_tracers(bgc)}()
+
+update_biogeochemical_state!(model, ::IgnoreNegativeTracerValues) = nothing
+
+# Evaluation-time treatments may be combined with state-mutating treatments in a
+# tuple. Detect IgnoreNegativeTracerValues recursively so composition preserves
+# its view-only semantics, including inside nested tuples produced while resolving
+# model-dependent ScaleNegativeTracers treatments.
+@inline ignores_negative_tracer_values(::IgnoreNegativeTracerValues) = Val(true)
+@inline ignores_negative_tracer_values(::Any) = Val(false)
+@inline ignores_negative_tracer_values(::Tuple{}) = Val(false)
+
+@inline function ignores_negative_tracer_values(treatments::Tuple)
+    first_ignored = ignores_negative_tracer_values(first(treatments))
+    return ignores_negative_tracer_values(first_ignored, Base.tail(treatments))
+end
+
+@inline ignores_negative_tracer_values(::Val{true}, ::Tuple) = Val(true)
+@inline ignores_negative_tracer_values(::Val{false}, treatments::Tuple) = ignores_negative_tracer_values(treatments)
+
+# Concentration tracers are evaluated as nonnegative by default. Temperature and
+# salinity are signed environmental state variables even when a biogeochemical
+# model lists them among its required tracers. Models can add further exceptions.
+@inline ignore_negative_value_for_tracer(::Type, ::Val) = Val(true)
+@inline ignore_negative_value_for_tracer(::Type, ::Val{:T}) = Val(false)
+@inline ignore_negative_value_for_tracer(::Type, ::Val{:S}) = Val(false)
+
+# Continuous-form models receive required tracer values first, followed by any
+# auxiliary values. The required tracer names are resolved into the treatment
+# type before GPU execution so no Symbol-dependent dispatch is needed in kernels.
+@generated function ignored_negative_values(::Type{B}, ::Val{names}, values::V) where {B, names, V <: Tuple}
+    transformed = Any[]
+    nrequired = length(names)
+    nvalues = length(V.parameters)
+
+    for i in 1:nvalues
+        if i <= nrequired
+            name = names[i]
+            ignore = ignore_negative_value_for_tracer(B, Val(name))
+            if ignore isa Val{true}
+                push!(transformed, :(max(getfield(values, $i), zero(getfield(values, $i)))))
+            else
+                push!(transformed, :(getfield(values, $i)))
+            end
+        else
+            push!(transformed, :(getfield(values, $i)))
+        end
+    end
+
+    return :(($(transformed...),))
+end
+
+@inline ignore_negative_tracer_names(::IgnoreNegativeTracerValues{N}) where N = Val{N}()
+@inline ignore_negative_tracer_names(::Any) = Val{nothing}()
+@inline ignore_negative_tracer_names(::Tuple{}) = Val{nothing}()
+
+@inline function ignore_negative_tracer_names(treatments::Tuple)
+    first_names = ignore_negative_tracer_names(first(treatments))
+    return ignore_negative_tracer_names(first_names, Base.tail(treatments))
+end
+
+@inline ignore_negative_tracer_names(names::Val{N}, ::Tuple) where N = names
+@inline ignore_negative_tracer_names(::Val{nothing}, treatments::Tuple) = ignore_negative_tracer_names(treatments)
+
+@inline evaluate_continuous_biogeochemistry(treatment, bgc, args...) =
+    evaluate_continuous_biogeochemistry(ignore_negative_tracer_names(treatment), bgc, args...)
+
+@inline function evaluate_continuous_biogeochemistry(names::Val{N}, bgc, val_name, x, y, z, t, values...) where N
+    values = ignored_negative_values(typeof(bgc), names, values)
+    return bgc(val_name, x, y, z, t, values...)
+end
+
+@inline evaluate_continuous_biogeochemistry(::Val{nothing}, bgc, args...) = bgc(args...)
+
+# Discrete-form models index fields inside their tendency functions. Construct a
+# NamedTuple with the same field names but nonnegative views for required
+# concentration tracers. Field names are available as type parameters, so the
+# transformation is fully static and GPU-safe.
+struct NonnegativeValueField{F}
+    field :: F
+end
+
+@inline function Base.getindex(field::NonnegativeValueField, I...)
+    value = @inbounds getfield(field, :field)[I...]
+    return max(value, zero(value))
+end
+
+Base.eltype(field::NonnegativeValueField) = eltype(getfield(field, :field))
+Base.eltype(::Type{NonnegativeValueField{F}}) where F = eltype(F)
+Base.size(field::NonnegativeValueField, args...) = size(getfield(field, :field), args...)
+Base.axes(field::NonnegativeValueField, args...) = axes(getfield(field, :field), args...)
+Base.parent(field::NonnegativeValueField) = getfield(field, :field)
+
+adapt_structure(to, field::NonnegativeValueField) =
+    NonnegativeValueField(adapt(to, getfield(field, :field)))
+
+@inline function Base.getproperty(field::NonnegativeValueField, name::Symbol)
+    name === :field && return getfield(field, :field)
+    return getproperty(getfield(field, :field), name)
+end
+
+# Chlorophyll-dependent light attenuation is evaluated through the same policy.
+# Wrapping the derived chlorophyll field keeps this generic across light models
+# while leaving the prognostic tracer fields untouched.
+@inline chlorophyll(treatment, bgc, model) =
+    chlorophyll(ignores_negative_tracer_values(treatment), bgc, model)
+@inline chlorophyll(::Val{true}, bgc, model) = NonnegativeValueField(chlorophyll(bgc, model))
+@inline chlorophyll(::Val{false}, bgc, model) = chlorophyll(bgc, model)
+
+@generated function ignored_negative_fields(::Type{B}, ::Val{required}, fields::NamedTuple{names}) where {B, required, names}
+    transformed = Any[]
+
+    for (i, name) in enumerate(names)
+        ignore = name in required && ignore_negative_value_for_tracer(B, Val(name)) isa Val{true}
+        if ignore
+            push!(transformed, :(NonnegativeValueField(getfield(fields, $i))))
+        else
+            push!(transformed, :(getfield(fields, $i)))
+        end
+    end
+
+    return :(NamedTuple{$(QuoteNode(names))}(($(transformed...),)))
+end
+
+@inline evaluate_discrete_biogeochemistry(treatment, bgc, i, j, k, grid, val_name, clock, fields, auxiliary_fields) =
+    evaluate_discrete_biogeochemistry(ignore_negative_tracer_names(treatment),
+                                      bgc, i, j, k, grid, val_name, clock, fields, auxiliary_fields)
+
+@inline function evaluate_discrete_biogeochemistry(names::Val{N}, bgc, i, j, k, grid, val_name, clock, fields, auxiliary_fields) where N
+    fields = ignored_negative_fields(typeof(bgc), names, fields)
+    return bgc(i, j, k, grid, val_name, clock, fields, auxiliary_fields)
+end
+
+@inline evaluate_discrete_biogeochemistry(::Val{nothing}, bgc, i, j, k, grid, val_name, clock, fields, auxiliary_fields) =
+    bgc(i, j, k, grid, val_name, clock, fields, auxiliary_fields)
+
 #####
 ##### Infastructure to rescale negative values
 #####
 
-struct ScaleNegativeTracers{FA, SA, FV, W}
-           tracers :: FA
+struct ScaleNegativeTracers{T, SA, FV, W}
       scalefactors :: SA
 invalid_fill_value :: FV
               warn :: W
 
-    ScaleNegativeTracers(tracers::FA, scalefactors::SA, invalid_fill_value::FV, warn::W) where {FA, SA, W, FV} =
-        warn ? error("Warning not currently implemented") : new{FA, SA, FV, W}(tracers, scalefactors, invalid_fill_value, warn)
+    function ScaleNegativeTracers(tracers, scalefactors::SA, invalid_fill_value::FV, warn::W) where {SA, W, FV}
+        warn && error("Warning not currently implemented")
+        return new{tracers, SA, FV, W}(scalefactors, invalid_fill_value, warn)
+    end
 end
 
-adapt_structure(to, snt::ScaleNegativeTracers) = ScaleNegativeTracers(adapt(to, snt.tracers),
+@inline scaled_tracers(::ScaleNegativeTracers{T}) where T = T
+
+@inline function Base.getproperty(scale::ScaleNegativeTracers, name::Symbol)
+    name === :tracers && return scaled_tracers(scale)
+    return getfield(scale, name)
+end
+
+adapt_structure(to, snt::ScaleNegativeTracers) = ScaleNegativeTracers(scaled_tracers(snt),
                                                                       adapt(to, snt.scalefactors),
                                                                       adapt(to, snt.invalid_fill_value),
                                                                       adapt(to, snt.warn))
 
 """
+    ScaleNegativeTracers(; invalid_fill_value = NaN, warn = false)
+
+Construct a scaling treatment whose conserved tracer groups are inferred from the underlying
+biogeochemical model when it is passed as `negative_tracers` to [`Biogeochemistry`](@ref) or a
+model constructor.
+"""
+ScaleNegativeTracers(; invalid_fill_value = NaN, warn = false) =
+    ScaleNegativeTracers(nothing, nothing, invalid_fill_value, warn)
+
+@inline resolve_negative_tracers(scale::ScaleNegativeTracers{nothing}, bgc) =
+    ScaleNegativeTracers(bgc; invalid_fill_value = scale.invalid_fill_value, warn = scale.warn)
+
+"""
     ScaleNegativeTracers(; tracers, scalefactors = ones(length(tracers)), warn = false, invalid_fill_value = NaN)
 
-Constructs a modifier to scale `tracers` so that none are negative. Use like:
+Constructs a negative-tracer treatment to scale `tracers` so that none are negative. Use like:
 ```julia
-modifier = ScaleNegativeTracers((:P, :Z, :N))
-biogeochemistry = Biogeochemistry(...; modifier)
+negative_tracers = ScaleNegativeTracers((:P, :Z, :N))
+biogeochemistry = Biogeochemistry(...; negative_tracers)
 ```
 This method is better, though still imperfect, method to prevent numerical errors that lead to
-negative tracer values compared to [`ZeroNegativeTracers`](@ref). Please see [discussion in
+negative tracer values compared to [`ClipNegativeTracers`](@ref). Please see [discussion in
 github](https://github.com/OceanBioME/OceanBioME.jl/discussions/48).
 
 Future plans include implement a positivity-preserving timestepping scheme as the ideal alternative.
@@ -84,13 +256,15 @@ function ScaleNegativeTracers(tracers; scalefactors = ones(length(tracers)), inv
         error("Incorrect number of scale factors provided")
     end
 
+    tracers = Tuple(tracers)
+    scalefactors = Tuple(scalefactors)
     return ScaleNegativeTracers(tracers, scalefactors, invalid_fill_value, warn)
 end
 
 """
-    ScaleNegativeTracers(bgc::AbstractBiogeochemistry; warn = false)
+    ScaleNegativeTracers(bgc::AbstractBiogeochemistry; invalid_fill_value = NaN, warn = false)
 
-Construct a modifier to scale the conserved tracers in `bgc` biogeochemistry.
+Construct a negative-tracer treatment to scale the conserved tracers in `bgc` biogeochemistry.
 
 If `warn` is true then scaling will raise a warning.
 """
@@ -103,7 +277,7 @@ end
 function ScaleNegativeTracers(tracers::NTuple{<:Any, Symbol};
                               invalid_fill_value=NaN,
                               warn=false,)
-    scalefactors = ones(length(tracers))
+    scalefactors = ntuple(_ -> 1.0, length(tracers))
 
     return ScaleNegativeTracers(tracers, scalefactors, invalid_fill_value, warn)
 end
