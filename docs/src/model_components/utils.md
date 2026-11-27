@@ -14,8 +14,13 @@ wizard = TimeStepWizard(cfl = 0.6, diffusive_cfl = 0.5, max_change = 1.5, min_ch
 simulation.callbacks[:wizard] = Callback(wizard, IterationInterval(10))
 ```
 
-## Negative tracer detection
-As a temporary measure we have implemented a callback to either detect negative tracers and either scale a conserved group, force them back to zero, or throw an error. Please see the numerical implementations' page for details. This can be set up by:
+## Negative tracer corrections
+OceanBioME.jl provides `ClipNegativeTracers`, `ScaleNegativeTracers`, and
+`AntiNegativeTracers` for correcting negative tracer concentrations. See
+[Positivity preservation](@ref pos-preservation) for their conservation
+properties and an example using transported anti-tracers.
+
+`ScaleNegativeTracers` can be configured as follows:
 ```julia
 negativity_protection = ScaleNegativeTracers((:P, :Z, :N))
 biogeochemistry = Biogeochemistry(...; modifiers = negativity_protection)
@@ -33,7 +38,7 @@ biogeochemistry = Biogeochemistry(...; modifiers = negativity_protection)
 ```
 Separate `ScaleNegativeTracers` modifiers are applied one after the other, so each would change the totals of the others. The `scale_negatives = true` option of the models does this for the groups given by `OceanBioME.conserved_tracers(biogeochemistry)`. Alternatively, force to zero by:
 ```julia
-negativity_protection = ZeroNegativeTracers()
+negativity_protection = ClipNegativeTracers()
 biogeochemistry = Biogeochemistry(...; modifiers = negativity_protection)
 ```
 The latter optionally takes a named tuple of parameters that may include `exclude`, which can be a tuple of tracer names (Symbols) which are allowed to be negative.

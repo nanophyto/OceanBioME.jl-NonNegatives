@@ -11,7 +11,7 @@ import Base: summary, show
 import Oceananigans.Biogeochemistry: update_tendencies!, update_biogeochemical_state!
 
 """
-    ZeroNegativeTracers(; exclude = ())
+    ClipNegativeTracers(; exclude = ())
 
 Construct a modifier that zeroes any negative tracers excluding those listed in `exclude`.
 
@@ -19,11 +19,17 @@ Construct a modifier that zeroes any negative tracers excluding those listed in 
     This method is _not_ recommended as a way to preserve positivity of tracers since
     it does not conserve the total tracer.
 """
-@kwdef struct ZeroNegativeTracers{E}
-    exclude :: E = ()
-end
+struct ClipNegativeTracers{E} end
 
-function update_biogeochemical_state!(model, zero::ZeroNegativeTracers)
+ClipNegativeTracers(exclude) = ClipNegativeTracers{Tuple(exclude)}()
+ClipNegativeTracers(; exclude = ()) = ClipNegativeTracers(exclude)
+
+# Keep tracer names in the type rather than in CUDA kernel arguments.
+@inline Base.getproperty(zero::ClipNegativeTracers{E}, name::Symbol) where E =
+    name === :exclude ? E : getfield(zero, name)
+Base.propertynames(::ClipNegativeTracers, private::Bool=false) = (:exclude,)
+
+function update_biogeochemical_state!(model, zero::ClipNegativeTracers)
     for (tracer_name, tracer) in pairs(model.tracers)
         if !(tracer_name in zero.exclude)
             parent(tracer) .= max.(0.0, parent(tracer))
@@ -35,13 +41,21 @@ end
 ##### Infastructure to rescale negative values
 #####
 
-struct ScaleNegativeTracers{FA, SA, SH, OT, FV}
-             tracers :: FA
+struct ScaleNegativeTracers{T, SA, SH, OT, FV}
         scalefactors :: SA
               shared :: SH
     first_own_tracer :: OT
   invalid_fill_value :: FV
 end
+
+ScaleNegativeTracers(tracers::Tuple{Vararg{Symbol}}, scalefactors, shared, first_own_tracer, invalid_fill_value) =
+    ScaleNegativeTracers{tracers, typeof(scalefactors), typeof(shared), typeof(first_own_tracer), typeof(invalid_fill_value)}(
+        scalefactors, shared, first_own_tracer, invalid_fill_value)
+
+@inline Base.getproperty(scale::ScaleNegativeTracers{T}, name::Symbol) where T =
+    name === :tracers ? T : getfield(scale, name)
+Base.propertynames(::ScaleNegativeTracers, private::Bool=false) =
+    (:tracers, :scalefactors, :shared, :first_own_tracer, :invalid_fill_value)
 
 """
     ScaleNegativeTracers(tracers; scalefactors = ones(length(tracers)), invalid_fill_value = NaN)
@@ -54,7 +68,7 @@ modifier = ScaleNegativeTracers((:P, :Z, :N))
 biogeochemistry = Biogeochemistry(...; modifier)
 ```
 This method is better, though still imperfect, method to prevent numerical errors that lead to
-negative tracer values compared to [`ZeroNegativeTracers`](@ref). Please see [discussion in
+negative tracer values compared to [`ClipNegativeTracers`](@ref). Please see [discussion in
 github](https://github.com/OceanBioME/OceanBioME.jl/discussions/48).
 
 In each cell where a tracer is negative, the negative tracers are set to zero and the positive ones are

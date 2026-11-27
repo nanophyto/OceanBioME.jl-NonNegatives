@@ -53,7 +53,7 @@ export Sediments, FlatSediment
 export column_advection_timescale, sinking_advection_timescale, Budget
 
 # Positivity preservation utilities
-export ScaleNegativeTracers, ZeroNegativeTracers
+export ScaleNegativeTracers, ClipNegativeTracers, AntiNegativeTracers
 
 # Oceananigans extensions
 export ColumnField, isacolumn
@@ -136,7 +136,7 @@ Biogeochemistry(underlying_biogeochemistry::AbstractContinuousFormBiogeochemistr
                               modifiers)
 
 required_biogeochemical_tracers(bgc::CompleteBiogeochemistry) = 
-    required_biogeochemical_tracers(bgc.underlying_biogeochemistry)
+    (required_biogeochemical_tracers(bgc.underlying_biogeochemistry)..., modifier_tracers(bgc.modifiers)...)
 
 required_biogeochemical_auxiliary_fields(bgc::CompleteBiogeochemistry) = 
     required_biogeochemical_auxiliary_fields(bgc.underlying_biogeochemistry)
@@ -157,14 +157,14 @@ biogeochemical_auxiliary_fields(bgc::CompleteBiogeochemistry) =
                               adapt(to, bgc.light_attenuation),
                               nothing,
                               nothing,
-                              nothing)
+                              adapt(to, bgc.modifiers))
 
 @inline adapt_structure(to, bgc::DiscreteBiogeochemistry) = 
     DiscreteBiogeochemistry(adapt(to, bgc.underlying_biogeochemistry),
                             adapt(to, bgc.light_attenuation),
                             nothing,
                             nothing,
-                            nothing)
+                            adapt(to, bgc.modifiers))
 
 function update_tendencies!(bgc::CompleteBiogeochemistry, model)
     update_tendencies!(bgc, bgc.sediment, model)
@@ -175,8 +175,15 @@ end
 update_tendencies!(bgc, modifier, model) = nothing
 update_tendencies!(bgc, modifiers::Tuple, model) = [update_tendencies!(bgc, modifier, model) for modifier in modifiers]
 
-@inline (bgc::ContinuousBiogeochemistry)(args...) = bgc.underlying_biogeochemistry(args...)
-@inline (bgc::DiscreteBiogeochemistry)(args...) = 
+# Anti-tracers are passive tracers with zero biological tendencies.
+@inline is_anti_tracer_tendency(modifiers, i, j, k, grid, ::Val{name}, args...) where name =
+    name in modifier_tracers(modifiers)
+@inline is_anti_tracer_tendency(modifiers, args...) = false
+
+@inline (bgc::ContinuousBiogeochemistry)(args...) =
+    is_anti_tracer_tendency(bgc.modifiers, args...) ? zero(args[4]) : bgc.underlying_biogeochemistry(args...)
+@inline (bgc::DiscreteBiogeochemistry)(args...) =
+    is_anti_tracer_tendency(bgc.modifiers, args...) ? zero(args[4]) :
     bgc.underlying_biogeochemistry(args..., biogeochemical_auxiliary_fields(bgc))
 
 @inline (bgc::ContinuousBiogeochemistry{nothing})(i, j, k, grid, args...) = zero(grid)
